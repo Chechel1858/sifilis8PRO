@@ -1,0 +1,417 @@
+#!/usr/bin/env python3
+import tkinter as tk
+from tkinter import font as tkFont
+import psutil, datetime, threading, time, os, subprocess
+from collections import deque
+
+class NexusMonitorApp:
+    def __init__(self):
+        self.root = tk.Tk()
+        self.root.title('Nexus Monitor Pro')
+        self.root.geometry('480x700')
+        self.root.minsize(440, 620)
+        self.root.wm_attributes('-type', 'normal')
+        
+        # Стили и темы оформления
+        self.themes = {
+            'Catppuccin': {
+                'bg': '#1e1e2e', 'panel': '#181825', 'text': '#cdd6f4', 'subtext': '#a6adc8',
+                'accent': '#89b4fa', 'green': '#a6e3a1', 'yellow': '#f9e2af', 'red': '#f38ba8', 'border': '#313244'
+            },
+            'Cyberpunk': {
+                'bg': '#000b19', 'panel': '#001428', 'text': '#00ffcc', 'subtext': '#00a3a3',
+                'accent': '#ff0055', 'green': '#00ff66', 'yellow': '#ffff00', 'red': '#ff0055', 'border': '#002850'
+            },
+            'Nord': {
+                'bg': '#2e3440', 'panel': '#242933', 'text': '#d8dee9', 'subtext': '#88c0d0',
+                'accent': '#81a1c1', 'green': '#a3be8c', 'yellow': '#ebcb8b', 'red': '#bf616a', 'border': '#4c566a'
+            }
+        }
+        self.theme_names = list(self.themes.keys())
+        self.current_theme_idx = 0
+        self.colors = self.themes[self.theme_names[self.current_theme_idx]]
+        
+        self.root.configure(bg=self.colors['bg'])
+        
+        # Глобальное состояние
+        self.active_tab = 0
+        self.tabs = ['DASHBOARD', 'NETWORK', 'PROCESSES']
+        
+        # Истории для графиков (60 точек)
+        self.history = {
+            'cpu': deque([0]*60, maxlen=60),
+            'net_up': deque([0]*60, maxlen=60),
+            'net_down': deque([0]*60, maxlen=60),
+            'ping': deque([0]*60, maxlen=60)
+        }
+        
+        self.stats = {
+            'cpu': 0, 'cpu_cores': [], 'ram': 0, 'ram_used': '', 'ram_total': '', 
+            'disk': 0, 'disk_free': '', 'temp': 0, 'up': 0, 'down': 0, 'ping': 0,
+            'battery': 'N/A', 'battery_plugged': False, 'uptime': '0d 0h', 'processes': []
+        }
+        
+        self._pn = psutil.net_io_counters()
+        self._pt = time.time()
+        
+        self._setup_fonts()
+        self._build_ui()
+        
+        # Потоки обновлений
+        threading.Thread(target=self._update_stats_loop, daemon=True).start()
+        self.root.after(100, self._render_loop)
+
+    def _setup_fonts(self):
+        self.fonts = {
+            'h1': tkFont.Font(family='monospace', size=15, weight='bold'),
+            'h2': tkFont.Font(family='monospace', size=10, weight='bold'),
+            'body': tkFont.Font(family='monospace', size=9),
+            'small': tkFont.Font(family='monospace', size=8),
+            'micro': tkFont.Font(family='monospace', size=7)
+        }
+
+    def _build_ui(self):
+        # ВЕРХНЯЯ ПАНЕЛЬ
+        self.top_frame = tk.Frame(self.root, bg=self.colors['panel'], height=42)
+        self.top_frame.pack(fill=tk.X, side=tk.TOP)
+        self.top_frame.pack_propagate(False)
+        
+        # Кнопки вкладок
+        self.tab_buttons = []
+        for i, name in enumerate(self.tabs):
+            btn = tk.Label(self.top_frame, text=name, font=self.fonts['h2'], 
+                           bg=self.colors['panel'], fg=self.colors['subtext'], 
+                           cursor='hand2', padx=12, pady=10)
+            btn.pack(side=tk.LEFT)
+            btn.bind('<Button-1>', lambda e, idx=i: self.switch_tab(idx))
+            self.tab_buttons.append(btn)
+            
+        # Кнопка смены темы справа
+        self.theme_btn = tk.Label(self.top_frame, text=" 🌟 THEME ", font=self.fonts['small'],
+                                  bg=self.colors['bg'], fg=self.colors['text'],
+                                  bd=1, relief=tk.SOLID, cursor='hand2', padx=6, pady=4)
+        self.theme_btn.pack(side=tk.RIGHT, padx=10, pady=8)
+        self.theme_btn.bind('<Button-1>', lambda e: self.next_theme())
+
+        # НИЖНЯЯ ПАНЕЛЬ ИНТЕРАКТИВА
+        self.bottom_frame = tk.Frame(self.root, bg=self.colors['panel'], height=40)
+        self.bottom_frame.pack(fill=tk.X, side=tk.BOTTOM)
+        self.bottom_frame.pack_propagate(False)
+        
+        # Элементы поиска процессов (по умолчанию скрыты/управляются динамически)
+        self.search_label = tk.Label(self.bottom_frame, text=" 🔍 Filter:", font=self.fonts['body'], 
+                                     bg=self.colors['panel'], fg=self.colors['subtext'])
+        self.search_var = tk.StringVar()
+        self.search_var.trace_add("write", lambda *args: self._draw())
+        self.search_entry = tk.Entry(self.bottom_frame, textvariable=self.search_var, font=self.fonts['body'],
+                                     bg=self.colors['bg'], fg=self.colors['text'], insertbackground=self.colors['text'],
+                                     bd=1, relief=tk.SOLID, width=25)
+        
+        # Информационный текст на нижней панели
+        self.status_text = tk.Label(self.bottom_frame, text="", font=self.fonts['small'], 
+                                    bg=self.colors['panel'], fg=self.colors['subtext'])
+        self.status_text.pack(side=tk.LEFT, padx=15, pady=10)
+
+        # ХОЛСТ ГРАФИКИ
+        self.canvas = tk.Canvas(self.root, bg=self.colors['bg'], highlightthickness=0)
+        self.canvas.pack(fill=tk.BOTH, expand=True, padx=18, pady=15)
+        self.canvas.bind('<Configure>', lambda e: self.root.after_idle(self._draw))
+        
+        self.switch_tab(0)
+
+    def next_theme(self):
+        self.current_theme_idx = (self.current_theme_idx + 1) % len(self.theme_names)
+        self.colors = self.themes[self.theme_names[self.current_theme_idx]]
+        
+        # Перерисовка интерфейса под новую тему
+        self.root.configure(bg=self.colors['bg'])
+        self.top_frame.configure(bg=self.colors['panel'])
+        self.bottom_frame.configure(bg=self.colors['panel'])
+        self.canvas.configure(bg=self.colors['bg'])
+        self.search_label.configure(bg=self.colors['panel'], fg=self.colors['subtext'])
+        self.search_entry.configure(bg=self.colors['bg'], fg=self.colors['text'], insertbackground=self.colors['text'])
+        self.status_text.configure(bg=self.colors['panel'], fg=self.colors['subtext'])
+        self.theme_btn.configure(bg=self.colors['bg'], fg=self.colors['text'])
+        
+        self.switch_tab(self.active_tab)
+
+    def switch_tab(self, index):
+        self.active_tab = index
+        for i, btn in enumerate(self.tab_buttons):
+            if i == index:
+                btn.configure(fg=self.colors['accent'], bg=self.colors['bg'])
+            else:
+                btn.configure(fg=self.colors['subtext'], bg=self.colors['panel'])
+                
+        # Управление элементами нижней панели в зависимости от вкладки
+        if index == 2: # Вкладка процессов
+            self.status_text.pack_forget()
+            self.search_label.pack(side=tk.LEFT, padx=(15, 5), pady=10)
+            self.search_entry.pack(side=tk.LEFT, pady=10)
+        else:
+            self.search_label.pack_forget()
+            self.search_entry.pack_forget()
+            self.status_text.pack(side=tk.LEFT, padx=15, pady=10)
+            
+        self._draw()
+
+    def _update_stats_loop(self):
+        while True:
+            try:
+                # CPU общая и по ядрам
+                cpu_val = psutil.cpu_percent(interval=None)
+                self.stats['cpu'] = cpu_val
+                self.history['cpu'].append(cpu_val)
+                self.stats['cpu_cores'] = psutil.cpu_percent(percpu=True)
+                
+                # RAM подробная
+                ram = psutil.virtual_memory()
+                self.stats['ram'] = ram.percent
+                self.stats['ram_used'] = f"{ram.used / (1024**3):.1f}"
+                self.stats['ram_total'] = f"{ram.total / (1024**3):.1f}"
+                
+                # Disk
+                disk = psutil.disk_usage('/')
+                self.stats['disk'] = disk.percent
+                self.stats['disk_free'] = f"{disk.free / (1024**3):.1f} GB Free"
+                
+                # Температура
+                try:
+                    temps = psutil.sensors_temperatures()
+                    self.stats['temp'] = int(list(temps.values())[0][0].current) if temps else 0
+                except:
+                    self.stats['temp'] = 0
+                    
+                # Батарея
+                try:
+                    batt = psutil.sensors_battery()
+                    if batt:
+                        self.stats['battery'] = f"{batt.percent}%"
+                        self.stats['battery_plugged'] = batt.power_plugged
+                    else:
+                        self.stats['battery'] = 'AC'
+                        self.stats['battery_plugged'] = True
+                except:
+                    self.stats['battery'] = 'N/A'
+
+                # Сеть скорость
+                net = psutil.net_io_counters()
+                ct = time.time()
+                dt = ct - self._pt
+                if dt > 0:
+                    up_speed = (net.bytes_sent - self._pn.bytes_sent) / dt / 1048576
+                    down_speed = (net.bytes_recv - self._pn.bytes_recv) / dt / 1048576
+                    self.stats['up'] = up_speed
+                    self.stats['down'] = down_speed
+                    self.history['net_up'].append(up_speed)
+                    self.history['net_down'].append(down_speed)
+                    self._pn = net
+                    self._pt = ct
+
+                # Пинг замер (высокоточный)
+                try:
+                    out = subprocess.check_output(['ping', '-c', '1', '-W', '1', '8.8.8.8'], universal_newlines=True)
+                    if 'time=' in out:
+                        p_time = float(out.split('time=')[1].split(' ')[0])
+                        self.stats['ping'] = p_time
+                        self.history['ping'].append(p_time)
+                    else:
+                        self.stats['ping'] = 0
+                        self.history['ping'].append(0)
+                except:
+                    self.stats['ping'] = -1
+                    self.history['ping'].append(0)
+
+                # Процессы
+                procs = []
+                for p in psutil.process_iter(['pid', 'name', 'cpu_percent', 'memory_percent']):
+                    try:
+                        procs.append((p.info['pid'], p.info['name'], p.info['cpu_percent'], p.info['memory_percent']))
+                    except:
+                        continue
+                self.stats['processes'] = sorted(procs, key=lambda x: x[2] or 0, reverse=True)
+
+                # Uptime
+                uptime_sec = int(time.time() - psutil.boot_time())
+                d, r = divmod(uptime_sec, 86400)
+                h, r = divmod(r, 3600)
+                self.stats['uptime'] = f'{d}d {h}h'
+
+            except:
+                pass
+            time.sleep(0.8)
+
+    def _get_color(self, val, thresholds=(50, 80)):
+        if val < thresholds[0]: return self.colors['green']
+        if val < thresholds[1]: return self.colors['yellow']
+        return self.colors['red']
+
+    def _draw_bar(self, y, val, label, sub_label=""):
+        w = self.canvas.winfo_width()
+        color = self._get_color(val)
+        
+        self.canvas.create_text(0, y, text=label, font=self.fonts['h2'], fill=self.colors['text'], anchor='w')
+        self.canvas.create_text(w, y, text=f"{val:.1f}%", font=self.fonts['h2'], fill=color, anchor='e')
+        if sub_label:
+            self.canvas.create_text(w - 65, y, text=sub_label, font=self.fonts['small'], fill=self.colors['subtext'], anchor='e')
+            
+        bar_y = y + 16
+        self.canvas.create_rectangle(0, bar_y, w, bar_y + 6, fill=self.colors['panel'], outline='')
+        fill_w = max(1, int((val / 100) * w))
+        self.canvas.create_rectangle(0, bar_y, fill_w, bar_y + 6, fill=color, outline='')
+        return bar_y + 22
+
+    def _draw_graph(self, y, height, data, color, title, unit=""):
+        w = self.canvas.winfo_width()
+        self.canvas.create_text(0, y, text=title, font=self.fonts['h2'], fill=self.colors['text'], anchor='w')
+        
+        current_val = data[-1] if data else 0
+        self.canvas.create_text(w, y, text=f"{current_val:.1f} {unit}", font=self.fonts['h2'], fill=color, anchor='e')
+        
+        graph_y = y + 16
+        self.canvas.create_rectangle(0, graph_y, w, graph_y + height, fill=self.colors['panel'], outline=self.colors['border'])
+        
+        if not data or max(data) == 0: return graph_y + height + 25
+        
+        max_val = max(max(data), 100 if unit == "%" else max(data)*1.2)
+        
+        points = []
+        step = w / (len(data) - 1) if len(data) > 1 else w
+        for i, val in enumerate(data):
+            px = i * step
+            py = graph_y + height - (val / max_val * height)
+            points.extend([px, py])
+            
+        if len(points) >= 4:
+            self.canvas.create_line(points, fill=color, width=2)
+            # Заливка области под графиком
+            points = [0, graph_y + height] + points + [w, graph_y + height]
+            self.canvas.create_polygon(points, fill=color, stipple='gray25', outline='')
+
+        return graph_y + height + 25
+
+    def _draw_dashboard(self, w, h):
+        y = 10
+        # Заголовок времени
+        time_str = datetime.datetime.now().strftime('%H:%M:%S')
+        self.canvas.create_text(0, y, text=time_str, font=self.fonts['h1'], fill=self.colors['accent'], anchor='w')
+        self.canvas.create_text(w, y, text=f"UPTIME: {self.stats['uptime']}", font=self.fonts['body'], fill=self.colors['subtext'], anchor='e')
+        y += 35
+        
+        # Общий график процессора
+        y = self._draw_graph(y, 65, list(self.history['cpu']), self.colors['accent'], "CPU LOAD HISTORY", "%")
+        
+        # Поядерный мини-мониторинг (Сетка ядер)
+        cores = self.stats['cpu_cores']
+        if cores:
+            self.canvas.create_text(0, y, text="CPU CORES BREAKDOWN", font=self.fonts['small'], fill=self.colors['subtext'], anchor='w')
+            y += 12
+            col_w = w / 4
+            for i, c_val in enumerate(cores):
+                row = i // 4
+                col = i % 4
+                cx = col * col_w
+                cy = y + (row * 14)
+                c_color = self._get_color(c_val)
+                self.canvas.create_text(cx, cy, text=f"C{i}:{int(c_val):2d}%", font=self.fonts['micro'], fill=c_color, anchor='w')
+            y += ((len(cores) - 1) // 4 + 1) * 14 + 15
+
+        # Полосы памяти и диска
+        ram_lbl = f"{self.stats['ram_used']}/{self.stats['ram_total']} GB"
+        y = self._draw_bar(y, self.stats['ram'], "MEMORY USAGE", ram_lbl)
+        y = self._draw_bar(y, self.stats['disk'], "STORAGE", self.stats['disk_free'])
+        y += 10
+        
+        # Инфо-блоки внизу страницы
+        box_w = (w - 15) / 2
+        
+        # Блок температуры
+        self.canvas.create_rectangle(0, y, box_w, y+55, fill=self.colors['panel'], outline='')
+        self.canvas.create_text(10, y+15, text="THERMALS", font=self.fonts['small'], fill=self.colors['subtext'], anchor='w')
+        t_color = self._get_color(self.stats['temp'], (55, 75))
+        self.canvas.create_text(10, y+38, text=f"{self.stats['temp']} °C", font=self.fonts['h1'], fill=t_color, anchor='w')
+        
+        # Блок батареи
+        self.canvas.create_rectangle(box_w+15, y, w, y+55, fill=self.colors['panel'], outline='')
+        self.canvas.create_text(box_w+25, y+15, text="POWER SOURCE", font=self.fonts['small'], fill=self.colors['subtext'], anchor='w')
+        batt_status = "⚡ " + self.stats['battery'] if self.stats['battery_plugged'] else "🔋 " + self.stats['battery']
+        self.canvas.create_text(box_w+25, y+38, text=batt_status, font=self.fonts['h2'], fill=self.colors['green'], anchor='w')
+
+        # Статус нижней панели
+        self.status_text.configure(text=f"System Theme: {self.theme_names[self.current_theme_idx]} | All systems nominal.")
+
+    def _draw_network(self, w, h):
+        y = 10
+        self.canvas.create_text(0, y, text="NETWORK PERFORMANCE", font=self.fonts['h1'], fill=self.colors['accent'], anchor='w')
+        y += 35
+        
+        y = self._draw_graph(y, 75, list(self.history['net_down']), self.colors['green'], "↓ DOWNLOAD SPEED", "MB/s")
+        y = self._draw_graph(y, 75, list(self.history['net_up']), self.colors['red'], "↑ UPLOAD SPEED", "MB/s")
+        
+        # График пинга / стабильности сети
+        ping_val = self.stats['ping']
+        p_color = self.colors['green'] if ping_val < 50 else self.colors['yellow'] if ping_val < 150 else self.colors['red']
+        if ping_val == -1: p_color = self.colors['red']
+        
+        y = self._draw_graph(y, 60, list(self.history['ping']), p_color, "📡 NETWORK LATENCY (PING 8.8.8.8)", "ms")
+        
+        self.status_text.configure(text=f"Current Latency: {ping_val:.1f} ms | Adapter: Active")
+
+    def _draw_processes(self, w, h):
+        y = 10
+        self.canvas.create_text(0, y, text="PROCESS MANAGER", font=self.fonts['h1'], fill=self.colors['accent'], anchor='w')
+        y += 35
+        
+        # Заголовки таблицы процессов
+        self.canvas.create_text(0, y, text="PID", font=self.fonts['small'], fill=self.colors['subtext'], anchor='w')
+        self.canvas.create_text(60, y, text="NAME", font=self.fonts['small'], fill=self.colors['subtext'], anchor='w')
+        self.canvas.create_text(w-65, y, text="RAM%", font=self.fonts['small'], fill=self.colors['subtext'], anchor='e')
+        self.canvas.create_text(w, y, text="CPU%", font=self.fonts['small'], fill=self.colors['subtext'], anchor='e')
+        
+        y += 14
+        self.canvas.create_line(0, y, w, y, fill=self.colors['border'])
+        y += 12
+        
+        # Фильтрация процессов на основе строки поиска
+        search_query = self.search_var.get().lower()
+        filtered_processes = [p for p in self.stats['processes'] if search_query in p[1].lower()]
+        
+        # Отображаем только то, что помещается на экране
+        max_visible = int((h - y) / 24)
+        for pid, name, cpu, ram in filtered_processes[:max_visible]:
+            cpu = cpu or 0
+            ram = ram or 0
+            name = (name[:22] + '..') if len(name) > 24 else name
+            c_color = self._get_color(cpu, (15, 45))
+            
+            self.canvas.create_text(0, y, text=str(pid), font=self.fonts['body'], fill=self.colors['subtext'], anchor='w')
+            self.canvas.create_text(60, y, text=name, font=self.fonts['body'], fill=self.colors['text'], anchor='w')
+            self.canvas.create_text(w-65, y, text=f"{ram:.1f}", font=self.fonts['body'], fill=self.colors['text'], anchor='e')
+            self.canvas.create_text(w, y, text=f"{cpu:.1f}", font=self.fonts['body'], fill=c_color, anchor='e')
+            y += 23
+
+    def _draw(self):
+        if not hasattr(self, 'canvas'): return 
+        w = self.canvas.winfo_width()
+        h = self.canvas.winfo_height()
+        if w <= 1 or h <= 1: return
+        
+        self.canvas.delete('all')
+        
+        if self.active_tab == 0:
+            self._draw_dashboard(w, h)
+        elif self.active_tab == 1:
+            self._draw_network(w, h)
+        elif self.active_tab == 2:
+            self._draw_processes(w, h)
+
+    def _render_loop(self):
+        self._draw()
+        self.root.after(1000, self._render_loop) 
+
+    def run(self):
+        self.root.mainloop()
+
+if __name__ == '__main__':
+    app = NexusMonitorApp()
+    app.run()
